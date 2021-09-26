@@ -10,6 +10,9 @@ services:
       POSTGRES_PASSWORD: {{ .Secret }}
     volumes:
       - data-volume-{{ .UserID }}:/var/lib/postgresql/data
-
+{{- if .Backup.IsEnabled }}
+  backup:
+    image: spinup/wal-g:latest
+{{- end}}
 volumes:
   data-volume-{{ .UserID }}:

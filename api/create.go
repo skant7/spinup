@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -25,7 +26,9 @@ type service struct {
 	// one of arm64v8 or arm32v7 or amd64
 	Architecture string
 	//Port         uint
-	Db dbCluster
+	Db            dbCluster
+	BackupEnabled bool
+	Backup        backupConfig
 }
 
 type dbCluster struct {
@@ -39,6 +42,26 @@ type dbCluster struct {
 	Storage    string
 }
 
+type backupConfig struct {
+	Sc   Schedule    `json:"sc"`
+	Dest Destination `json:"Dest"`
+}
+
+// https://man7.org/linux/man-pages/man5/crontab.5.html
+type Schedule struct {
+	Minute uint16
+	Hour   uint16
+	DOM    uint16
+	Month  uint16
+	DOW    uint16
+}
+
+type Destination struct {
+	Name         string
+	BucketName   string
+	ApiKeyID     string
+	ApiKeySecret string
+}
 type serviceResponse struct {
 	HostName    string
 	Port        int
@@ -48,6 +71,8 @@ type serviceResponse struct {
 func Hello(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "hello !! Welcome to spinup \n")
 }
+
+var ctx = context.Background()
 
 func CreateService(w http.ResponseWriter, req *http.Request) {
 	if (*req).Method != "POST" {
@@ -111,7 +136,37 @@ func CreateService(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Internal server error ", 500)
 		return
 	}
-	updateSqliteDB(config.Cfg.Common.ProjectDir+"/"+s.UserID, s.UserID, s)
+	path := config.Cfg.Common.ProjectDir + "/" + s.UserID + "/" + s.Db.Name + ".db"
+	db, err := OpenSqliteDB(path)
+	if err != nil {
+		ErrorResponse(w, "error accessing database", 500)
+		return
+	}
+	sqlStmt := `
+	create table if not exists clusterInfo (id integer not null primary key autoincrement, clusterId text, Name text, Port integer);
+	`
+	ctx, _ = context.WithTimeout(ctx, 3*time.Second)
+	_, err = db.ExecContext(ctx, sqlStmt)
+	if err != nil {
+		log.Printf("%q: %s\n", err, sqlStmt)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stmt, err := tx.PrepareContext(ctx, "insert into clusterInfo(clusterId, name, port) values(?, ?, ?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+	_, err = stmt.ExecContext(ctx, s.Db.ID, s.Db.Name, s.Db.Port)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = tx.Commit()
+	if err != nil {
+		log.Fatal(err)
+	}
 	w.Write(jsonBody)
 }
 
@@ -120,7 +175,7 @@ func prepareService(s service, path string) error {
 	if err != nil {
 		return fmt.Errorf("ERROR: creating project directory at %s", path)
 	}
-	if err := createDockerComposeFile(path, s); err != nil {
+	if err := CreateDockerComposeFile(path, s); err != nil {
 		return fmt.Errorf("ERROR: creating service docker-compose file %v", err)
 	}
 	return nil
@@ -197,31 +252,89 @@ func lastContainerID() (string, error) {
 	return string(output), nil
 }
 
-func updateSqliteDB(path string, dbName string, data service) {
-	db, err := sql.Open("sqlite3", path+"/"+dbName+".db")
+func OpenSqliteDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer db.Close()
+	return db, nil
+}
+
+func CreateBackup(w http.ResponseWriter, r *http.Request) {
+	if (*r).Method != "POST" {
+		http.Error(w, "Invalid Method", http.StatusMethodNotAllowed)
+		return
+	}
+	var s service
+	byteArray, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		ErrorResponse(w, "error reading from request body", 500)
+		return
+	}
+	log.Println(string(byteArray))
+	err = json.Unmarshal(byteArray, &s)
+	if err != nil {
+		ErrorResponse(w, "error reading from readall body", 500)
+		return
+	}
+	fmt.Printf("%+v\n", s)
+	if !s.BackupEnabled {
+		ErrorResponse(w, "backup is not enabled", 400)
+		return
+	}
+	if s.Backup.Dest.Name != "AWS" {
+		http.Error(w, "Destination other than AWS is not supported", http.StatusInternalServerError)
+		return
+	}
+	if s.Backup.Dest.ApiKeyID == "" || s.Backup.Dest.ApiKeySecret == "" {
+		http.Error(w, "API key id and API key secret is mandatory", http.StatusInternalServerError)
+		return
+	}
+	path := config.Cfg.Common.ProjectDir + "/" + s.UserID + "/" + s.Db.Name + ".db"
+	log.Println("path:", path)
+	db, err := OpenSqliteDB(path)
+	if err != nil {
+		ErrorResponse(w, "error accessing database", 500)
+		return
+	}
+	err = db.Ping()
+	if err != nil {
+		ErrorResponse(w, "error connecting to database", 500)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	sqlStmt := `
-	create table if not exists clusterInfo (id integer not null primary key autoincrement, clusterId text, Name text, Port integer);
+	create table if not exists backup (id integer not null primary key autoincrement, clusterid text, foreign key(clusterid) references clusterinfo(clusterid), destination text, minute integer, hour integer, dom integer, month integer, dow integer);
 	`
-	_, err = db.Exec(sqlStmt)
+	ctx, cancel = context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, err = db.ExecContext(ctx, sqlStmt)
 	if err != nil {
 		log.Printf("%q: %s\n", err, sqlStmt)
+		ErrorResponse(w, "internal server error", 500)
 	}
 	tx, err := db.Begin()
 	if err != nil {
 		log.Fatal(err)
 	}
-	stmt, err := tx.Prepare("insert into clusterInfo(clusterId, name, port) values(?, ?, ?)")
+	stmt, err := tx.PrepareContext(ctx, "insert into backup(clusterId, destination, minute, hour, dom, month, dow) values(?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer stmt.Close()
-	_, err = stmt.Exec(data.Db.ID, data.Db.Name, data.Db.Port)
+	_, err = stmt.ExecContext(ctx, s.Db.ID, s.Backup.Dest, s.Backup.Sc.Minute, s.Backup.Sc.Hour, s.Backup.Sc.DOM, s.Backup.Sc.Month, s.Backup.Sc.DOW)
 	if err != nil {
 		log.Fatal(err)
 	}
-	tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		log.Fatal(err)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func ErrorResponse(w http.ResponseWriter, msg string, statuscode int) {
+	w.WriteHeader(statuscode)
+	w.Write([]byte(msg))
 }
